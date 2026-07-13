@@ -1,0 +1,23 @@
+# Postgres for LangGraph checkpoints + handoff_status table.
+# Bound to 127.0.0.1 only (never expose Postgres publicly — see runbook).
+services:
+  postgres:
+    image: postgres:16
+    container_name: tuyensinh-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tuyensinh
+      POSTGRES_PASSWORD: tuyensinh
+      POSTGRES_DB: tuyensinh
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - tuyensinh-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tuyensinh -d tuyensinh"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  tuyensinh-pgdata:
