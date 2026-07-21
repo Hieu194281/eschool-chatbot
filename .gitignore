@@ -1,0 +1,15 @@
+.claude
+
+# Python venv accidentally rooted at repo top-level
+bin/
+include/
+lib/
+lib64
+pyvenv.cfg
+__pycache__/
+*.py[cod]
+
+# Env / secrets
+.env
+.env.*
+!.env.example
