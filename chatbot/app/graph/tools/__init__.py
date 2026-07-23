@@ -13,7 +13,7 @@ from .lead_tools import (
     capture_lead,
     handoff_to_human,
 )
-from .retrieve_kb_tool import RETRIEVE_TOOL_NAME, retrieve_kb
+from .retrieve_kb_tool import RETRIEVE_K, RETRIEVE_TOOL_NAME, retrieve_kb
 
 ALL_TOOL_SCHEMAS = [retrieve_kb, capture_lead, book_trial, handoff_to_human]
 
@@ -21,6 +21,7 @@ __all__ = [
     "ALL_TOOL_SCHEMAS",
     "TOOL_IMPLS",
     "ToolResult",
+    "RETRIEVE_K",
     "RETRIEVE_TOOL_NAME",
     "retrieve_kb",
     "capture_lead",

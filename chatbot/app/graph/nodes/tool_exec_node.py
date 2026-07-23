@@ -11,7 +11,7 @@ to agent.
 
 from __future__ import annotations
 
-from ..tools import RETRIEVE_TOOL_NAME, TOOL_IMPLS
+from ..tools import RETRIEVE_K, RETRIEVE_TOOL_NAME, TOOL_IMPLS
 
 
 def _merge_hits(existing: list[dict], hits: list[dict]) -> list[dict]:
@@ -59,7 +59,7 @@ async def tool_exec_node(state: dict) -> dict:
 
         if name == RETRIEVE_TOOL_NAME:
             did_retrieve = True
-            hits = knowledge_base.retrieve(args.get("query", ""), k=3)
+            hits = knowledge_base.retrieve(args.get("query", ""), k=RETRIEVE_K)
             retrieved = _merge_hits(retrieved, hits)
             out_messages.append(ToolMessage(content=_format_hits(hits), tool_call_id=call_id))
         elif name in TOOL_IMPLS:

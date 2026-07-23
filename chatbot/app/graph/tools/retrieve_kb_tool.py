@@ -8,6 +8,7 @@ some path calls it directly — it still returns a useful string.
 from langchain_core.tools import tool
 
 RETRIEVE_TOOL_NAME = "retrieve_kb"
+RETRIEVE_K = 5          # danh mục nhỏ → lấy rộng để câu hỏi "có mấy khóa" phủ hết
 
 
 @tool
@@ -17,7 +18,7 @@ def retrieve_kb(query: str) -> str:
     khi trả lời bất kỳ câu hỏi nào về khóa học/học phí/lịch."""
     from ...kb import knowledge_base
 
-    hits = knowledge_base.retrieve(query, k=3)
+    hits = knowledge_base.retrieve(query, k=RETRIEVE_K)
     if not hits:
         return "Không tìm thấy dữ liệu phù hợp trong kho kiến thức."
     return "\n---\n".join(h["text"] for h in hits)
