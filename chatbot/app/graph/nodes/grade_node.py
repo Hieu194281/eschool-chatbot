@@ -23,9 +23,24 @@ def _last_human_text(state: dict) -> str:
     return ""
 
 
+def _grade_chunks(retrieved: list[dict]) -> list[str]:
+    """Grade context = mô tả (đã embed) + giá verbatim của khóa đó.
+
+    Giá KHÔNG bao giờ được embed cho RAG (golden rule), nhưng bộ phân loại đủ/thiếu
+    BẮT BUỘC phải thấy giá — nếu không, câu hỏi học phí bị chấm 'thiếu' oan rồi
+    rẽ sang fallback (bot né dù giá đã có sẵn trong hit).
+    """
+    chunks = []
+    for h in retrieved or []:
+        text = h.get("text", "")
+        pricing = h.get("pricing", "")
+        chunks.append(f"{text}\n{pricing}".strip() if pricing else text)
+    return chunks
+
+
 async def grade_node(state: dict) -> dict:
     question = _last_human_text(state)
-    chunks = [h.get("text", "") for h in state.get("retrieved") or []]
+    chunks = _grade_chunks(state.get("retrieved") or [])
     llm = lite_llm().with_structured_output(GradeResult)
     result = await with_retry(lambda: llm.ainvoke(build_grade_prompt(question, chunks)))
     return {"grade_sufficient": bool(result.sufficient)}

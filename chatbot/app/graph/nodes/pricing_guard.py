@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from ...common.message_content import content_to_text
 from ...common.vn_numerals import iter_money_tokens
 from ..prompts import HONEST_FALLBACK
 
@@ -95,7 +96,9 @@ def pricing_guard_node(state: dict) -> dict:
     last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
     if last_ai is None or not getattr(last_ai, "content", None):
         return {}
-    draft = last_ai.content if isinstance(last_ai.content, str) else str(last_ai.content)
+    # Flatten to text FIRST — on Gemini, str(content) would leak the base64 thought
+    # signature, whose "<digit>K" runs get parsed as bogus prices → false violations.
+    draft = content_to_text(last_ai.content)
 
     verdict = evaluate_draft(draft, state.get("retrieved", []) or [])
     if verdict.ok:

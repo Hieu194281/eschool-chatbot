@@ -30,9 +30,13 @@ _EST_TOKENS_PER_TURN = 2000   # crude proxy for the daily Gemini-spend guard (Ph
 def _extract_reply(state: dict) -> str:
     from langchain_core.messages import AIMessage
 
+    from ..common.message_content import content_to_text
+
     for msg in reversed(state.get("messages", []) or []):
-        if isinstance(msg, AIMessage) and getattr(msg, "content", None):
-            return msg.content if isinstance(msg.content, str) else str(msg.content)
+        if isinstance(msg, AIMessage):
+            text = content_to_text(getattr(msg, "content", None))
+            if text:
+                return text
     return ""
 
 
