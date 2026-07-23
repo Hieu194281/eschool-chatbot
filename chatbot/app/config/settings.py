@@ -25,11 +25,17 @@ class Settings(BaseSettings):
     verify_token: str = ""
     messenger_api_version: str = "v21.0"
 
-    # ── Gemini ───────────────────────────────────────────────
-    google_api_key: str = ""
-    gemini_model_main: str = "gemini-2.5-flash"
-    gemini_model_lite: str = "gemini-2.5-flash-lite"
-    gemini_embed_model: str = "gemini-embedding-001"
+    # ── LLM (provider-agnostic via init_chat_model — see llm/chat_clients.py) ─
+    # Model ids carry the provider prefix, so switching provider is an .env
+    # change, NOT a code change:
+    #   openai:gpt-4o-mini   |   google_genai:gemini-2.5-flash   |   anthropic:...
+    llm_api_key: str = ""
+    llm_model_main: str = "openai:gpt-4o-mini"     # agent — tool-calling + warmth
+    llm_model_lite: str = "openai:gpt-4o-mini"     # grade + reflect — cheap, temp 0
+    llm_embed_model: str = "openai:text-embedding-3-small"  # RAG embeddings
+    # OpenAI-COMPATIBLE gateway base URL (e.g. ViRouter/OpenRouter). Blank = the
+    # provider's official endpoint. Used only with the `openai:` provider.
+    llm_base_url: str = ""
 
     # ── Google Sheet KB + leads ──────────────────────────────
     google_sa_json_path: str = ""
@@ -63,13 +69,22 @@ class Settings(BaseSettings):
     # ── LangGraph hardening ──────────────────────────────────
     langgraph_strict_msgpack: bool = True
 
+    # ── LangSmith tracing (observability) ────────────────────
+    # Bật để xem mọi node graph / lần gọi LLM / tool trên UI LangSmith.
+    # Các key nằm trong .env nhưng LangChain đọc os.environ, nên
+    # app.observability.configure_langsmith() cầu nối sang lúc khởi động.
+    langsmith_tracing: bool = False
+    langsmith_api_key: str = ""
+    langsmith_project: str = "eschool-chatbot"
+    langsmith_endpoint: str = ""    # blank → https://api.smith.langchain.com (mặc định)
+
     # Secrets required for the service to actually serve real traffic.
     # (Kept minimal so unit tests can construct Settings without live creds.)
     _REQUIRED_FOR_SERVE = (
         "page_access_token",
         "app_secret",
         "verify_token",
-        "google_api_key",
+        "llm_api_key",
         "postgres_dsn",
     )
 

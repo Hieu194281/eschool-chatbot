@@ -31,6 +31,9 @@ async def lifespan(app: FastAPI):
         "LANGGRAPH_STRICT_MSGPACK", "true" if settings.langgraph_strict_msgpack else "false"
     )
 
+    from .observability import configure_langsmith
+    configure_langsmith()   # no-op unless LANGSMITH_TRACING=true + key present
+
     from .integrations import telegram_notify
     telegram_notify.set_main_loop(asyncio.get_running_loop())
 

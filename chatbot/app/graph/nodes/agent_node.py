@@ -1,4 +1,4 @@
-"""Agent node — Gemini 2.5 Flash + bind_tools loop.
+"""Agent node — LLM (provider-agnostic via init_chat_model) + bind_tools loop.
 
 Builds the LLM message list = [system prompt] + [ephemeral KB context] +
 [state messages], binds the tools, and returns the AIMessage. Retrieved chunks are

@@ -1,6 +1,6 @@
-"""Bounded retry-with-jitter for Gemini calls (red-team #4).
+"""Bounded retry-with-jitter for LLM calls (red-team #4).
 
-Each turn issues 2-4 Gemini calls; a transient 429/5xx/timeout should not lose the
+Each turn issues 2-4 LLM calls; a transient 429/5xx/timeout should not lose the
 turn. Wrap each call in `with_retry`. On final give-up the exception propagates so
 the caller (dispatcher) can send a soft-fail line + alert — the user's message is
 NOT silently dropped.
@@ -35,7 +35,7 @@ async def with_retry(fn, *, retries: int = 3, base: float = 0.5, cap: float = 8.
             if attempt == retries or not is_retryable(exc):
                 raise
             delay = min(cap, base * (2 ** attempt)) + random.uniform(0, base)
-            logger.warning("Gemini call failed (attempt %d/%d), retrying in %.2fs: %s",
+            logger.warning("LLM call failed (attempt %d/%d), retrying in %.2fs: %s",
                            attempt + 1, retries, delay, exc)
             await asyncio.sleep(delay)
     raise last_exc  # unreachable, keeps type-checkers happy

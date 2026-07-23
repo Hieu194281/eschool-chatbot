@@ -13,7 +13,7 @@ import pytest
 os.environ.setdefault("PAGE_ACCESS_TOKEN", "test-page-token")
 os.environ.setdefault("APP_SECRET", "test-app-secret")
 os.environ.setdefault("VERIFY_TOKEN", "test-verify-token")
-os.environ.setdefault("GOOGLE_API_KEY", "test-google-key")
+os.environ.setdefault("LLM_API_KEY", "test-llm-key")
 os.environ.setdefault("TELEGRAM_WEBHOOK_SECRET", "test-webhook-secret")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-bot-token")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "123456")

@@ -3,7 +3,7 @@ snapshot (red-team #15).
 
 Concurrency model:
 - `rebuild()` runs OFF the event loop (BackgroundScheduler thread, or a thread
-  executor on startup). The Gemini embedding network call happens while holding
+  executor on startup). The embedding network call happens while holding
   NO lock.
 - The active KB is a single immutable `_Snapshot(store, pricing, meta, version)`.
   Publishing a rebuild is ONE attribute rebind (`self._snapshot = snap`), which is
@@ -47,13 +47,18 @@ class KnowledgeBase:
 
     def _ensure_embeddings(self):
         if self._embeddings is None:
-            from langchain_google_genai import GoogleGenerativeAIEmbeddings
+            from langchain.embeddings import init_embeddings
 
             settings = get_settings()
-            self._embeddings = GoogleGenerativeAIEmbeddings(
-                model=settings.gemini_embed_model,
-                google_api_key=settings.google_api_key,
-            )
+            # Provider-agnostic, same as the chat clients: the embed model id
+            # carries the provider prefix (e.g. "openai:text-embedding-3-small").
+            kwargs = {"api_key": settings.llm_api_key or None}
+            # base_url applies ONLY to the openai provider (gateway like ViRouter);
+            # other providers (google_genai, …) reject it. Gate on the prefix so
+            # switching the embed provider stays a pure .env change.
+            if settings.llm_embed_model.startswith("openai:") and settings.llm_base_url:
+                kwargs["base_url"] = settings.llm_base_url
+            self._embeddings = init_embeddings(settings.llm_embed_model, **kwargs)
         return self._embeddings
 
     @staticmethod
