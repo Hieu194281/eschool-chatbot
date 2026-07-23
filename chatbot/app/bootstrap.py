@@ -91,3 +91,40 @@ def build_channel_stack(app, settings: Settings, handoff_manager):
     app.state.debounce = DebounceBuffer(settings.debounce_seconds, dispatcher.on_flush)
     app.state.http_client = http_client
     return http_client
+
+
+def build_telegram_stack(app, settings: Settings, handoff_manager, rate_limiter):
+    """Wire kênh Telegram polling: TelegramAdapter + dispatcher + dedupe/debounce,
+    dùng CHUNG rate_limiter + handoff_manager với Messenger.
+
+    Khác Messenger một điểm CỐ Ý: `deliver_fn=adapter.send_text` → gửi TRỰC TIẾP,
+    KHÔNG qua shadow gate. Vì đây là kênh test tương tác, người test phải THẤY bot
+    trả lời (Messenger vẫn tôn trọng SHADOW_MODE, an toàn cho khách thật).
+
+    Trả về (poller, tg_http_client). Caller (lifespan) chạy poller.run() như task
+    và đóng tg_http_client khi shutdown.
+    """
+    import httpx
+
+    from .channel.debounce_buffer import DebounceBuffer
+    from .channel.dedupe_store import DedupeStore
+    from .channel.message_dispatcher import MessageDispatcher
+    from .channel.telegram_adapter import TelegramAdapter
+    from .channel.telegram_poller import TelegramPoller
+    from .integrations import telegram_notify
+
+    tg_http = httpx.AsyncClient(timeout=40.0)     # > POLL_TIMEOUT(25s) để giữ long-poll
+    adapter = TelegramAdapter(tg_http, settings.telegram_bot_token)
+    dispatcher = MessageDispatcher(
+        adapter, rate_limiter,
+        deliver_fn=adapter.send_text,             # DIRECT — bỏ shadow gate (kênh test)
+        handoff_gate=handoff_manager,
+        error_notify=telegram_notify.notify,
+    )
+    dedupe = DedupeStore()
+    debounce = DebounceBuffer(settings.debounce_seconds, dispatcher.on_flush)
+    poller = TelegramPoller(adapter, dispatcher, dedupe, debounce, rate_limiter)
+    app.state.telegram_adapter = adapter
+    app.state.telegram_dispatcher = dispatcher
+    logger.info("Telegram stack wired (polling, DIRECT send)")
+    return poller, tg_http

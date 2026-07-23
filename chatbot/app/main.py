@@ -54,13 +54,30 @@ async def lifespan(app: FastAPI):
         set_graph(build_graph(saver))
         http_client = build_channel_stack(app, settings, handoff_manager)
         purge_task = asyncio.create_task(run_purge_loop(settings.pii_retention_days))
+
+        # Kênh Telegram polling (dev/test) — khởi động CÙNG app nếu bật + có token.
+        tg_task = None
+        tg_http = None
+        if settings.telegram_polling and settings.telegram_bot_token:
+            from .bootstrap import build_telegram_stack
+
+            poller, tg_http = build_telegram_stack(
+                app, settings, handoff_manager, app.state.rate_limiter
+            )
+            tg_task = asyncio.create_task(poller.run())
+            logger.info("Telegram polling task started")
+
         logger.info("Startup complete (SHADOW_MODE=%s)", settings.shadow_mode)
         try:
             yield
         finally:
             purge_task.cancel()
+            if tg_task is not None:
+                tg_task.cancel()
             sync_scheduler.shutdown()
             await http_client.aclose()
+            if tg_http is not None:
+                await tg_http.aclose()
             await close_pool()
 
 

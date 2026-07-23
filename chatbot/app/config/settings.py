@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_webhook_secret: str = ""
+    # Bật kênh Telegram polling (kênh dev/test tương tác) khởi động cùng app.
+    # Gửi TRỰC TIẾP cho người chat (bỏ shadow gate) — xem chú thích ở bootstrap.
+    telegram_polling: bool = False
 
     # ── Rate limit / spend caps ──────────────────────────────
     rate_limit_per_min: int = 10
