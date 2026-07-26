@@ -1,274 +1,285 @@
-# Algorithms & Implementation Details — Tuyển Sinh Concierge (Pha 1)
+# Algorithms & Implementation Details — Tuyển Sinh Concierge (Pha 2)
 
-> Mọi thuật toán / cơ chế bảo vệ đã dùng, kèm cách kiểm thử. Đọc file này để biết
-> "cần test cái gì". Grammar-terse per project convention.
+> Mọi thuật toán, KB structure, guard logic, sales state machine (Pha 2 v2).
+> Đọc để hiểu "cần test cái gì" + "non-obvious behaviors". Grammar-terse.
 
-Stack: FastAPI + LangGraph StateGraph + Gemini 2.5 Flash/Flash-Lite + Google Sheets
-KB + Postgres (AsyncPostgresSaver checkpoints + `handoff_status`) + Telegram.
+Stack: FastAPI + LangGraph + Gemini Flash/Flash-Lite + Google Sheets KB + Postgres + Telegram.
 Golden rule: **bot không bao giờ tự chế học phí/ưu đãi/cam kết**.
+323 tests pass (WSL). Catalog: 15 khóa in-context (phương án C, "full" mode ≤30).
 
 ---
 
-## 0. Graph shape (bộ não)
+## 0. Graph entry-to-exit (2026-07-26 v2 topology)
 
 ```
-START → agent
-agent   ──tool_calls──> tool_exec ──retrieved──> grade_chunks ──sufficient──> agent
-        └──final text──> reflect_lite                        └─insufficient──> fallback → reflect_lite
-tool_exec ──no retrieve──> agent      (loop cap → fallback)
-reflect_lite ──ok/safest──> pricing_guard ──> END
-             └──1 fix────> agent
+START → detect_objection (entry, reset per-turn counters)
+    ↓ no_objection / repeat / escalate
+    ├─→ ESCALATE → run_handoff_to_human (DB + Telegram) → END
+    ├─→ REPEAT (2nd+ objection) → handle_objection → agent
+    │       ↓
+    │   agent → tool_exec → grade_chunks
+    │       ├→ sufficient → reflect_node → pricing_guard → END
+    │       └→ insufficient → fallback → reflect_node → END
+    │
+    └─→ NO_OBJECTION → agent → tool_exec → ...
 ```
-- `agent`: Gemini Flash + `bind_tools`. Inject retrieved chunks as **UNTRUSTED DATA**,
-  pricing as **SỐ LIỆU CHÍNH THỨC** (2 system messages, ephemeral — không lưu vào history).
-- Order rationale: `reflect_lite` (fuzzy promise/tone) THEN `pricing_guard`
-  (deterministic, authoritative) = last gate before send.
+
+**Entry node changes (v2):**
+- `detect_objection_node` resets per-turn counters: `tool_rounds`, `reflect_count`, `objection_fix_done`, etc.
+- Classifies objection type (fail-OPEN). ESCALATE routes to `run_handoff_to_human` (writes handoff_status DB + Telegram notify, not advisory).
+- REPEAT routes to `handle_objection` for 1 reframe attempt.
+
+**Defense-in-depth:** Agent (Flash) → tool_exec (retrieve/upsert) → grade (sufficiency) → reflect (promise gate) → pricing_guard (authoritative money gate) = each layer can block before send.
 
 ---
 
-## 1. VN-numeral normalizer (`app/common/vn_numerals.py`)
+## 1. KB v2: 3-tab split + in-context catalog (`app/kb/`)
 
-Mục tiêu: canonical-hoá mọi cách viết tiền VN về **int VND** để so khớp.
-Property quan trọng nhất = **consistency** (cùng input → cùng output ở cả draft và KB).
+**Sheet schema (3 tabs):**
+- **Courses**: 15 rows (course_id + 6 prose + 9 verbatim). No embed, entirely in-context.
+- **Center**: ~10 center FAQs (topic, prose). Embedded in vector store.
+- **FAQ**: ~50+ vendor FAQs (question, answer). Embedded in vector store.
 
-Regex alternation (ordered, `finditer` consume — không đếm trùng):
-1. `pct`: `\d+%` → giữ giá trị %.
-2. `mil`: `X triệu|tr|củ [rưỡi|Y]` → `X*1e6` (+ `1e6/2` nếu "rưỡi"; + `int(Y)*10^(6-len(Y))` cho "4tr5"→+500k, "4tr500"→+500k, "4tr05"→+50k). `tr(?![a-zà-ỹ])` tránh nuốt "trăm/trung".
-3. `k`: `X nghìn|ngàn|k` → `X*1e3`.
-4. `grouped`: `1.500.000` / `1,500,000` → bỏ separator → int.
-5. `bare`: `\d{6,}` (≥100k) → int. Bỏ số điện thoại (`^0\d{8,10}$`).
+**Parsing pipeline:**
+1. `sheet_loader.load_kb()` reads all 3 tabs (replaces v1's `load_courses()`)
+2. `cell_sanitizer.py` (NEW, split from course_parser.py for reuse): Trust gates + cell collectors
+   - **Sanitization (C3 FIXED):** Patterns match against FOLDED text (accents removed). Injection-gate checks for imperative forms only (so "Chính sách & quy tắc lớp học" is ordinary, not quarantined).
+   - `is_prose_cell_safe()` (allows newlines; forbids trust-marker/instructions) + `is_verbatim_cell_safe()` (no newlines) applied to all cells landing in prompt
+3. `course_parser.py`: Per-course validation (re-exports sanitizers)
+   - PROSE_FIELDS → in-context block
+   - VERBATIM_FIELDS → `facts_map` (byte-identical)
+   - Rows failing sanitization → quarantine + alert
+3. `course_block_builder.py`: Fold into **index line** (25 tok) + **detail block** (440 tok, prose + marked facts)
+4. `center_faq_parser.py`: Parse Center + FAQ → Document (doc_id, text)
+5. `catalog_assembler.py`: Weave Index + Details into **system prompt** (~7K tokens for 15 courses)
+6. `vector_store.py`: Embed Center + FAQ only. Build `facts_map` (course_id → all money/pct values)
 
-False-positive guard: số không có đơn vị tiền + < 6 chữ số bị bỏ → "lớp 6", "2 buổi",
-"15/8", "năm 2026" KHÔNG bị coi là tiền. Ambiguous forms fail-closed (an toàn).
+**Atomic snapshot:**
+`rebuild()` (5-min schedule, OFF event loop) reads sheet, parses, embeds Center+FAQ, then **1 GIL-held swap** of `_snapshot=(store, facts_map, metadata)`. Reader grabs snapshot once per turn → no half-state, no lock across network. Rebuild fail → retain last-good + alert.
 
-**API:** `money_values(text)->set[int]`, `percent_values(text)->set[int]`.
-**Test:** `tests/test_vn_numerals.py` (10 cases: `4tr5`==`4.500.000`, phone bỏ, %…).
-
----
-
-## 2. Pricing-guard — DETERMINISTIC, AUTHORITATIVE (`app/graph/nodes/pricing_guard.py`)
-
-`evaluate_draft(draft, retrieved) -> GuardVerdict(ok, violations, named_course_ids)`:
-
-1. **Resolve named course(s):** course nào có `ten_khoa` xuất hiện trong draft (exact
-   substring HOẶC ≥60% từ ≥3 ký tự khớp). Nếu không match và chỉ có 1 course retrieved →
-   bind vào course đó (single-candidate). Nếu 0 match & nhiều course → named=∅.
-2. **Allowed set:** union `money_values` + `percent_values` của pricing string CỦA
-   RIÊNG named courses (giá gắn với `course_id`, KHÔNG phải "xuất hiện đâu đó trong k=3").
-3. **Membership:** mọi money/pct token trong draft phải ∈ allowed set.
-   - Discount tự tính (5tr−10%→"4tr5" không có literal trong Sheet) → không ∈ allowed → **reject** (tự động, không cần tính %).
-   - Giá khóa A gán cho khóa B → allowed của B không chứa → **reject**.
-4. **Free-claim:** "miễn phí/free" trong draft chỉ hợp lệ nếu pricing của named course cũng có "miễn phí".
-5. **Fail-closed:** bất kỳ violation → node thay draft bằng **HONEST_FALLBACK** + set
-   `handoff=True`, `sales_stage="cần người"` (replace AIMessage theo cùng `id`).
-
-Node `pricing_guard_node` chỉ import langchain lazily; `evaluate_draft` là **pure**.
-**Test:** `tests/test_pricing_guard.py` (10 cases: exact pass, computed-discount reject,
-wrong-course reject, free-claim reject, %-binding, no-course fail-closed).
+**Growth path (unchanged at any scale):**
+- ≤30: Full (Index + Detail in prompt)
+- 30–80: Index mode (Index in prompt + `get_course_detail(cid)` tool, 0-token)
+- >80: Future RAG on description; facts stay dict lookup (0 token, unaffected)
 
 ---
 
-## 3. Reflect-lite — promise/tone ONLY (`app/graph/nodes/reflect_node.py`)
+## 2. VN-numeral normalizer (`app/common/vn_numerals.py`, C2 FIXED)
 
-Số đã chuyển hết sang pricing_guard. Reflect chỉ bắt hứa hẹn cấm + giọng điệu:
-1. **Deterministic blocklist first** (`reflect_prompt.py`): regex các cụm
-   "đảm bảo đậu/giỏi/điểm", "cam kết…", "chắc chắn…", "miễn phí 100%", "bao đậu"…
-2. Nếu blocklist không bắt → **Flash-Lite** `with_structured_output(ReflectResult{ok,issues,fixed_reply})`
-   bắt paraphrase.
-3. Bounded fix: có `fixed_reply`/strip → apply ngay (replace by id) → guard. Không fix
-   được → bounce agent MỘT lần (`reflect_count` guard) qua `fix_hint` ephemeral. Hết
-   lượt → gửi HONEST_FALLBACK. **Không loop vô hạn.**
+**Goal:** All VN price formats → int VND for consistent matching (draft ↔ facts).
 
-**Test:** `tests/test_reflect_lite.py` (blocklist bắt/không, strip).
+**Parsing order** (finditer, first match wins):
+1. Percent: `\d+%`
+2. Spelled-out millions (C2 FIXED): `bốn triệu rưỡi` → 4.5M via `milw` regex group + _WORD_DIGITS dict
+3. Numeric millions: `X triệu [rưỡi|Y]` → `X*1e6 ± (0.5M if rưỡi) ± Y-fraction`
+4. Thousands: `X nghìn|X ngàn|X k`
+5. Grouped: `1.500.000`, `1,500,000` → strip separator
+6. Bare: `\d{6,}` (≥100k). **Exclude** phone `^0\d{8,10}$`.
 
----
+**False-positive guard:** Bare <6 digits without unit → ignored ("lớp 6", "2 buổi", "15/8" safe).
 
-## 4. Corrective-RAG grade → fallback (`grade_node.py`, `fallback_node.py`)
-
-`grade_chunks` (Flash-Lite, structured `{sufficient, reason}`) phân loại ngữ cảnh đủ/thiếu.
-`sufficient=false` → `fallback_node` chèn câu honest + `handoff=True` + `sales_stage="cần người"`.
-`_last_human_text` duck-type trên `.type=="human"` (không cần import langchain — dễ test).
-**Test:** `tests/test_grade_fallback.py` (stub Flash-Lite → route đúng).
+**Test:** `test_vn_numerals.py` (4tr5, bốn triệu rưỡi, phone skip, %).
 
 ---
 
-## 5. KB layer — atomic snapshot + validation (`app/kb/`)
+## 3. Pricing Guard — fail-CLOSED deterministic gate (`app/graph/nodes/pricing_guard.py` + `guard_matching.py` + `guard_checks.py`)
 
-- **Split (golden rule tại data layer):** `course_parser.py` build 1 Document/khóa từ
-  các trường mô tả; `hoc_phi`/`uu_dai` giữ verbatim trong `pricing_map`, **KHÔNG embed**.
-- **Partial-row validation:** row có `course_id` nhưng thiếu `ten_khoa`/`hoc_phi` (rỗng/space)
-  → loại + error (không phục vụ giá thiếu).
-- **Pricing-cell sanitization:** ô `hoc_phi`/`uu_dai` chứa newline / chuỗi "SỐ LIỆU CHÍNH
-  THỨC" / mẫu lệnh (ignore, bỏ qua, system:, ```…) → quarantine cả khóa (chống forge marker/injection).
-- **Atomic snapshot (`vector_store.py`):** `rebuild()` chạy OFF event loop
-  (BackgroundScheduler thread / executor). Build store + embed (network call **không giữ lock**),
-  rồi 1 lần rebind `self._snapshot=(store,pricing,meta,version)` (GIL-atomic). Reader
-  (`retrieve`) đọc snapshot 1 lần → không bao giờ thấy nửa vời/desync, không giữ lock qua network.
-  Rebuild fail → giữ last-good snapshot + alert.
-- **Test:** `tests/test_course_parser.py` (split, partial-row, injection quarantine, dup, schema).
+**Input:** draft text + full course catalog (facts_map).
+**Output:** `GuardVerdict(ok, violations, named_course_ids, quoted_price)`.
 
----
+**Per-sentence binding (C1 FIXED):**
+- Draft split on sentence boundaries (`_SEGMENT_SPLIT_RE` with lookaround to preserve "1.800.000")
+- **Each sentence bound separately** to courses it names
+- Multi-course in one sentence + money → blocked as ambiguous (_MULTI_COURSE, kind=AMBIGUOUS)
+- Single-course sentence can inherit draft-level context binding only if draft-level is exactly 1 unambiguous course
+- `_drop_shadowed` removes course whose ten_khoa is substring of another matched name (avoids shadowing)
 
-## 6. Tool execution + state mutation (`tool_exec_node.py`, `tools/lead_tools.py`)
+**4-tier matching per-sentence:**
+1. **Exact ten_khoa substring** → bind
+2. **Alias keyword** (tu_khoa list, ≥4 chars, word-boundary, non-stopword FIXED) → bind
+3. **≥3-char substring** → maybe (containment flag)
+4. **Jaccard ratio** (after stripping money/date spans FIXED, need ≥2 name words FIXED)
 
-Không phụ thuộc "Command-from-tool" API (version-robust). `bind_tools` chỉ dùng schema;
-node `tool_exec` tự execute: đọc `tool_calls`, gọi `TOOL_IMPLS[name](args, state)` (async,
-trả `ToolResult(message, state_update)`), trả về ToolMessages + **state_update** →
-LangGraph ghi thẳng channels `handoff`/`sales_stage`/`lead_profile` (fix "handoff no-op").
-Mỗi tool_call đều có ToolMessage (tránh dangling). `retrieve_kb` → build `pricing_context`
-+ route `grade_chunks`; tool khác → route `agent`. Loop cap `tool_rounds` (4) → fallback.
+**Pricing check:**
+- Extract money/pct via `vn_numerals` (includes word-numerals: "mười lăm triệu", "một triệu tám", C2 FIXED)
+- `check_money` runs on every bound sentence; `check_schedule` runs only if sentence NAMES the course (not inherited binding, to avoid blocking centre hours/trial slots)
+- All tokens must ∈ that course's facts
+- Multi-course + money → violation (no attribution)
+- No course + money → violation (NO_COURSE)
+- Computed discount not in facts → violation
+- Free-claim without facts → violation
 
----
+**Fail-closed:** Any violation → HONEST_FALLBACK + `handoff: True` (advisory) + NO changes to sales_stage (key diff from v1).
 
-## 7. Checkpointer lifecycle (`main.py`)
+**DA_BAO_GIA write (H3 FIXED):** When verdict is OK and draft quoted a verified price for a bound course, `advance_stage()` to DA_BAO_GIA (via GuardVerdict.quoted_price). This enables phone-ask step next turn.
 
-`AsyncPostgresSaver.from_conn_string(dsn)` là **async context manager** → giữ mở suốt
-đời app: `async with … as saver: await saver.setup(); set_graph(build_graph(saver)); …; yield`.
-Không drop context (nếu drop → pool đóng → mọi ainvoke fail). `thread_id="{channel}:{user_id}"`.
-Env `LANGGRAPH_STRICT_MSGPACK=true`. Gemini call bọc `with_retry` (jitter backoff 429/5xx/timeout);
-give-up → dispatcher gửi soft-fail line + alert (không mất lượt im lặng).
+**Key architectural:** `state["handoff"]` is NOW READ by `message_dispatcher._invoke_graph` to distinguish "bot escalated itself this turn" (state["handoff"]=true) from "human owns thread for future turns" (handoff_status table). Authoritative gate for LATER turns: `handoff_status` table (set by real takeover). Guard does NOT write sales_stage (only real takeover does).
 
----
-
-## 8. Channel adapter (`app/channel/`, `app/api/webhook_messenger.py`)
-
-- **Signature:** `verify_signature` HMAC-SHA256 constant-time (`hmac.compare_digest`);
-  thiếu/không hợp lệ → 403 trước mọi xử lý.
-- **Fast ACK:** POST verify sig SYNC → schedule `process_events` qua FastAPI
-  `BackgroundTasks` (drained on graceful shutdown, KHÔNG bare `create_task`) → trả 200 ngay.
-- **Dedupe (`dedupe_store.py`):** `dict[mid→expiry]` OrderedDict, TTL 600s + **bounded LRU**
-  (maxsize evict oldest). `seen(mid)` True nếu đã thấy.
-- **Debounce (`debounce_buffer.py`):** buffer/user, gộp fragment, cancel-reschedule timer
-  `DEBOUNCE_SECONDS`. Flush **pop buffer TRƯỚC** khi await on_flush → fragment giữa lượt vào
-  buffer mới (next batch). Bounded LRU.
-- **Single-flight (`message_dispatcher.py`):** `asyncio.Lock`/thread_id bọc flush→invoke→send.
-  2 tin cùng thread → serialize, KHÔNG 2 ainvoke song song (chống clobber checkpoint).
-- **Rate-limit (`rate_limiter.py`):** sliding window/PSID (deque msgs/min + msgs/day), global
-  concurrency `Semaphore`, daily-spend counter (proxy ~2000 tok/turn) → alert + degrade
-  (BUDGET_DEGRADE_LINE) khi vượt `GEMINI_DAILY_BUDGET`. Bounded windows.
-- **Send API:** typing_on → text `messaging_type=RESPONSE`, split >1800 ký tự, 429 backoff.
-- **Adapter ABC** → Zalo drop-in sau (spine không đổi).
-- **Test:** `test_signature_verify`, `test_dedupe_store`, `test_debounce_buffer`,
-  `test_rate_limit`, `test_single_flight`, `test_webhook_idempotency`.
+**Tests:** `test_guard_matching.py`, `test_guard_checks.py`, `test_pricing_guard.py`.
 
 ---
 
-## 9. Handoff + resume (`app/handoff/`, `app/db/handoff_status_table.py`)
+## 4. Reflect node — promise/tone gate + bounded repair (`app/graph/nodes/reflect_node.py`)
 
-- **Authoritative = table `handoff_status`** (O(1) gate). `ConvState.handoff` chỉ advisory.
-- **Atomic touch + auto-resume clock (fix clock-freeze):** `touch_user_and_get` = 1 câu SQL
-  (CTE snapshot prev + upsert `last_user_ts=now()`), trả **prev** values. `before_invoke`:
-  touch mỗi inbound → nếu prev_active & silence gap > 24h (dựa prev_user_ts, và no recent
-  last_human_ts) → auto-resume; ngược lại skip bot. `should_auto_resume` là **pure**.
-- **TOCTOU close:** `before_send` re-check `is_active` NGAY trước khi gửi → drop reply nếu
-  handoff bật giữa lượt invoke.
-- **Resume:** `/resume messenger:<PSID>` từ Telegram → `handoff_manager.clear`.
-- **Lead upsert (`lead_sheet.py`):** locate row bằng **`ws.find` (VALUE)**, không enumerate
-  index → staff xóa row giữa không ghi đè nhầm SĐT. Re-find ngay trước write + per-user lock.
-- **Test:** `test_handoff_resume` (pure + gate + auto-resume), `test_lead_upsert`
-  (dedupe + **middle-row-delete correctness**).
+**Step 1 — blocklist:** Scan for forbidden clichés ("bao đậu", "cam kết đậu", "miễn phí 100%").
 
----
+**Step 2 — LLM paraphrase (Flash-Lite):** If blocklist miss → structured `{ok, issues, fixed_reply}`.
 
-## 10. Telegram webhook auth (`app/api/webhook_telegram.py`)
+**Step 3 — repair bounded (H6 FIXED, M2 FIXED):**
+- If `fixed_reply` → apply + re-route to pricing_guard
+- Else → bounce agent **once** (reflect_count ≤1) with ephemeral `fix_hint`
+- After 1 repair, any violation → HONEST_FALLBACK + stamp `phone_asked_at` (M2 FIXED: phone-gate checks timestamp immediately after, so suppression timestamp doesn't survive the block)
 
-Verify header `X-Telegram-Bot-Api-Secret-Token` == `TELEGRAM_WEBHOOK_SECRET`
-(constant-time) TRƯỚC khi parse. Body `chat_id` chỉ advisory, KHÔNG phải auth boundary.
-Forged/missing → 403. **Test:** `test_telegram_secret_token` (missing/wrong→403, valid→resume).
+**Per-turn reset (FIXED):** `reflect_count` + `objection_fix_done` reset by detect_objection_node on every inbound. Without this, repair paths die after turn 2.
+
+**Test:** `test_reflect_node.py`.
 
 ---
 
-## 11. PII / PDPD (`app/db/retention_purge.py`, `app/log_redaction_filter.py`)
+## 5. Grade node + fallback (`app/graph/nodes/grade_node.py`, `fallback_node.py`)
 
-- **Consent:** bot báo mục đích trước khi lưu SĐT; ghi `consent`/`consent_at` trên lead row.
-- **Retention purge (daily task):** `purge_expired(days)` xóa checkpoints + handoff rows +
-  lead rows quá hạn (dùng `handoff_status.last_user_ts` làm đồng hồ hoạt động thread).
-- **Delete-by-PSID:** `delete_by_psid(psid)` xóa checkpoint thread + handoff row + Leads row.
-- **Log redaction:** `PhoneRedactionFilter` (logging.Filter, gắn lên mọi root handler) mask
-  `0xxx***yy` — enforced, không phải convention.
-- **Cross-border:** Sheets/Telegram US-hosted → ghi cơ sở chuyển dữ liệu (business/legal).
-- **Test:** `test_retention_purge` (Sheet-side purge + delete_by_user). DB-side purge =
-  integration với Postgres thật.
+`grade_chunks(retrieved, query) → {sufficient: bool, reason}` (Flash-Lite structured).
+
+**Sufficient = false →** Fallback appends honest ("Cách em biết không đủ..."), sets `handoff: True` (advisory only), **does NOT change sales_stage** (that's reserved for real takeover). Flows to reflect for tone check.
+
+**Sufficient = true →** Continue to reflect.
+
+**Tests:** `test_grade_node.py`, `test_fallback_node.py`.
 
 ---
 
-## 12. Shadow mode (`app/channel/shadow_gate.py`)
+## 6. Sales stage machine (`app/graph/sales_stage.py`, `sales_playbook.py`)
 
-`make_deliver_fn(adapter)`: `SHADOW_MODE=true` → gửi `[DRAFT → PSID]` (HTML-escaped) lên
-Telegram, **0 tin tới user thật**; `false` → `adapter.send_text`. Dispatcher gọi qua deliver
-này (mọi tin user-facing, kể cả rate-limit/degrade line). **Test:** `test_shadow_mode`.
+**Canonical stages (v1 was free-text):**
+```
+MOI → DA_RO_NHU_CAU → DA_BAO_GIA → CO_SDT → DA_HEN_LICH → (terminal)
+                                        ↘ HANDOFF (exit, absorbing)
+```
 
----
+**Progression:** `advance_stage(current, target)` = max by ORDER. HANDOFF is terminal (once set, stays).
 
-## 13. Test coverage (68 tests, all green trên Python 3.10)
+**Write sites (H2 FIXED):**
+- `pricing_guard`: Writes DA_BAO_GIA when verdict OK + price quoted (H3 FIXED)
+- `capture_lead` tool: Writes CO_SDT when phone recorded
+- `book_trial` tool: Writes DA_HEN_LICH
+- Objection escalation (`run_handoff_to_human`): Writes HANDOFF (real takeover)
+- NOT written by fallback or guard on block (intentional; see H2 below)
 
-| File | Guard |
-|---|---|
-| test_vn_numerals | VN-numeral normalize |
-| test_pricing_guard | price↔course binding, computed-discount, free-claim, fail-closed |
-| test_reflect_lite | promise blocklist + strip |
-| test_grade_fallback | Corrective-RAG grade → route |
-| test_course_parser | KB split, partial-row, injection quarantine, schema |
-| test_signature_verify | HMAC constant-time |
-| test_dedupe_store | once + TTL + bounded LRU |
-| test_debounce_buffer | coalesce + reset + bounded |
-| test_rate_limit | per-min/day cap, budget alert, bounded |
-| test_single_flight | same-thread serialize / diff-thread overlap |
-| test_webhook_idempotency | resent mid → 1 flush |
-| test_lead_upsert | dedupe + **middle-row-delete correctness** |
-| test_handoff_resume | gate skip/proceed, auto-resume, TOCTOU, /resume parse |
-| test_telegram_secret_token | forged/missing → 403; valid → resume |
-| test_shadow_mode | draft-to-Telegram, zero user send |
-| test_retention_purge | purge past window + delete-by-user |
+**Stage semantics (H2 clarified):**
+- Corrective-RAG miss is routine (one per conversation expected). Setting stage=HANDOFF would kill elicitation permanently while bot still answers = confusing.
+- Only real takeover (objection escalation / human resume) writes HANDOFF stage.
+- Fallback/guard write advisory `handoff: True` field (not the stage).
 
-**Chạy:** `cd chatbot && pip install -r requirements.txt && pytest`
-(pure/async/integration subset chỉ cần pytest+pytest-asyncio+pydantic+httpx+fastapi;
-grade/reflect LLM paths dùng stub → không cần Gemini thật).
+**Playbook injection (sales_playbook.py):**
+- Turn-specific elicitation based on current stage
+- If HANDOFF stage → injects "tư vấn viên người thật tiếp quản"
+- If DA_BAO_GIA → can ask for phone (guarded by 24h timestamp + absence of violation this turn)
+
+**v1 compat:** `LEGACY_STAGE_MAP` reads old checkpoints ("đang tư vấn" → DA_RO_NHU_CAU). Never crashes on upgrade.
+
+**Tests:** `test_sales_stage_writes.py`, `test_sales_playbook.py`.
 
 ---
 
-## 14. Red-team fixes → nơi implement (17/17)
+## 7. Objection subsystem (`app/graph/nodes/detect_objection.py`, `handle_objection.py`, `prompts/objection_prompt.py`)
 
-| # | Fix | File |
-|---|---|---|
-| 1 | Deterministic pricing-guard + reflect demote | `pricing_guard.py`, `reflect_node.py` |
-| 2 | State-mutating tools ghi channels (no no-op) | `tool_exec_node.py`, `lead_tools.py` |
-| 3 | AsyncPostgresSaver context giữ mở | `main.py` |
-| 4 | LLM retry/backoff jitter, no dangling turn | `llm/retry.py`, `message_dispatcher.py` |
-| 5 | Per-thread single-flight lock | `message_dispatcher.py` |
-| 6 | Rate-limit + concurrency + bounded maps + budget | `rate_limiter.py`, `dedupe_store.py`, `debounce_buffer.py` |
-| 7 | BackgroundTasks (drained), residual window doc | `webhook_messenger.py` |
-| 8 | Telegram secret-token constant-time | `webhook_telegram.py` |
-| 9 | Lead upsert by `ws.find` value + per-user lock | `lead_sheet.py` |
-| 10 | Auto-resume clock touch-before-check | `handoff_manager.py`, `handoff_status_table.py` |
-| 11 | Handoff table authoritative + TOCTOU re-check | `handoff_manager.py`, `message_dispatcher.py` |
-| 12 | PII consent/retention/delete/log-redaction | `retention_purge.py`, `log_redaction_filter.py`, `lead_tools.py` |
-| 13 | Partial-row validation | `course_parser.py` |
-| 14 | Prompt-injection: UNTRUSTED framing + cell sanitize | `agent_node.py`, `course_parser.py` |
-| 15 | Vector-store atomic snapshot, lock-free readers | `vector_store.py` |
-| 16 | App Review critical path / milestones | `docs/deployment-guide.md`, `plan.md` |
-| 17 | Tests for new guards | `tests/` |
+**Detect (entry node):** Flash-Lite classifier, fail-OPEN. Outputs: `{type: ESCALATE|REPEAT|NO_OBJECTION, confidence}`.
+
+- SO_SANH_CHO_KHAC (competitor question) → ESCALATE always
+- Same objection group 2nd time → ESCALATE (prevent bot arguing in circles)
+- Else → REPEAT (attempt reframe) or NO_OBJECTION
+
+**Route logic (H1 FIXED — no-op fixed):**
+- ESCALATE → `run_handoff_to_human()` (writes handoff_status DB + Telegram notify). Real, not advisory.
+- REPEAT → `handle_objection` node (1 reframe attempt via Flash + objection_prompt)
+- NO_OBJECTION → normal flow
+
+**Handle:** Reframe objection (1 attempt per turn). Fail → fallback.
+
+**Per-turn reset (FIXED):** Detects resets ALL counters (tool_rounds, reflect_count, objection_fix_done, objection_count) on every inbound. Prevents "repair death after turn 2" (v1 bug).
+
+**Tests:** `test_detect_objection.py`, `test_handle_objection.py`.
 
 ---
 
-## 15. Known limitations / cần test thủ công với deps thật
+## 8. Tool execution + state mutation (`app/graph/nodes/tool_exec_node.py`, `tools/lead_tools.py`)
 
-- **Chưa chạy end-to-end với Gemini/Postgres/Sheets thật** (máy dev không có Python; đã
-  verify bằng compileall + 68 tests trên WSL Python 3.10 với deps tối thiểu, stub LLM/Sheets/DB).
-  Cần test thật: (a) 1 vòng graph có tool loop + checkpoint nhớ 2 lượt; (b) pricing_guard
-  reject số ngoài KB trên hội thoại thật; (c) handoff flip + Telegram notify; (d) KB sync từ
-  Sheet phản ánh sau 1 interval; (e) webhook handshake từ Meta.
-- **Version verify:** khi `pip install`, xác nhận model IDs + `AsyncPostgresSaver` import,
-  và exact API `with_structured_output` / tool schema của LangGraph bản cài; đã code
-  version-robust (execute tool trong node riêng, không phụ thuộc Command-from-tool).
-- **Gemini spend** = proxy ~2000 tok/turn (chưa đọc `usage_metadata` thật) → tinh chỉnh sau.
-- **Checkpoint retention** dựa `handoff_status.last_user_ts` (touch mỗi inbound) → thread
-  chưa từng inbound sẽ không có row (không cần purge). DB-side purge cần Postgres để test.
-- **Single worker** bắt buộc (in-memory state). Multi-worker = Redis (Pha 2).
-- **Post-ACK crash window** (mất fragment buffered) — durable queue = Pha 2.
+Tools return `ToolResult(message, state_update)`. Node wraps in ToolMessage, writes channels directly. No dangling ToolMessages (each tool_call gets a reply).
+
+**Retrieval tool:** kb.retrieve (Center+FAQ) → route grade_chunks. `pricing_context` bị XÓA ở Ph02 (facts always-on trong prompt, không ghép theo hit).
+
+**Capture_lead:** Upsert lead to Leads sheet, write CO_SDT stage (if phone recorded), route agent.
+
+**Confirm_schedule:** Log date, write DA_HEN_LICH stage, route agent.
+
+**Tool cap:** `tool_rounds` ≤4 per turn (reset by entry node). Exceed → fallback.
+
+**Tests:** `test_tool_exec_node.py`.
+
+---
+
+## 9. Handoff system (H1 FIXED — escalation is real) (`app/handoff/`, `handoff_status_table.py`)
+
+**Authoritative = `handoff_status` table,** not `state["handoff"]` field (advisory, no consumers).
+
+**Columns:** psid, active, owner_id, last_user_ts, last_human_ts, reason_code.
+
+**Atomic touch-before-check:** `before_invoke` calls `touch_user_and_get()` (upsert `last_user_ts=now()`, return prev values). If `active=true` AND silence gap >24h → auto-resume.
+
+**TOCTOU re-check:** `before_send` re-reads `is_active` just before dispatch. Handoff flipped mid-turn → drop reply.
+
+**Escalation write (H1 FIXED):** `run_handoff_to_human()` (called by objection escalation) writes handoff_status table + fires Telegram. No-op fixed.
+
+**Resume:** Telegram `/resume messenger:PSID` clears row.
+
+**Tests:** `test_handoff_resume.py`.
+
+---
+
+## 10. Metrics & shadow mode (`app/common/metrics_logger.py`, shadow_gate.py)
+
+**Shadow mode:** `SHADOW_MODE=true` → `[DRAFT → PSID]` to Telegram debug channel, 0 real sends.
+
+**Whitelist:** Phone (masked 0xxx***yy), draft, stage, course_id, etc. PII redaction enforced.
+
+**Tests:** `test_metrics_logger.py`, `test_shadow_mode.py`.
+
+---
+
+## 11. Graph routing (H8 FIXED — now tested) (`tests/test_graph_wiring.py`)
+
+`test_graph_wiring.py` compiles real graph, asserts every node registered, entry is detect_objection, every router destination is real, every reply-producing branch reaches pricing_guard.
+
+**Langgraph installed in test env.** Routing maps verified at build time.
+
+---
+
+## 12. Test coverage
+
+323 tests passing (WSL, Python 3.10):
+- Pure functions: vn_numerals, vn_dates, course_parser, guard_matching, guard_checks, sales_stage
+- Async (stubbed LLM): reflect, grade, detect_objection, lead_upsert, handoff_resume, dedupe, debounce, rate_limit
+- Integration: metrics_logger, shadow_mode
+- Graph wiring: test_graph_wiring (routes, nodes, entry, destinies)
+
+---
+
+## 13. Known open limitations (M-items, benign)
+
+**M4:** `check_money` is set-membership. Deposit quoted as tuition possible (documented limit, guard still protects numbers).
+
+**M8:** KB snapshot race (agent reads snapshot A, sync lands, guard reads snapshot B). Fails closed (safe), shows up as block-rate noise in metrics.
+
+**N4:** Two courses quoted in ONE comma-joined sentence are blocked. Bullet/newline format is OK.
+
+**Dangling tool_call:** If tool cap trips mid-turn and tool is in flight, no ToolMessage reply (pre-existing edge case).
+
+---
 
 ## Unresolved questions
-1. Ngưỡng "min real-conversation volume" trước khi flip `SHADOW_MODE=false` (đề xuất ≥50
-   convos / ≥30 câu hỏi giá) — cần business chốt.
-2. `GEMINI_DAILY_BUDGET` nên đặt bao nhiêu (đơn vị = proxy token/ngày) — cần đo thực tế.
-3. Cột `chat_link` hiện lưu `messenger:PSID`; có muốn deep-link page inbox cụ thể không?
+
+1. Multi-course quotes: Is "Khóa A và khóa B đều 3.000.000" valid sales tactic? Affects intersection vs fail-closed.
+2. Prose cell sanitization: Should multi-line prose (`lo_trinh`) be allowed, or newline-reject-only?
+3. Handoff field cleanup: `state["handoff"]` is now purely advisory (DB table is authoritative). Should the field be deleted?
+4. Live Leads schema: Do columns L–Q already exist, or need appending?
+5. Min volume before go-live: Coordinator recommends ≥50 conversations. Business consensus?
