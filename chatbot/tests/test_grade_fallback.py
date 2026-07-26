@@ -28,7 +28,8 @@ class _FakeLLM:
 async def test_insufficient_context_routes_fallback(monkeypatch):
     monkeypatch.setattr(grade_node_mod, "lite_llm",
                         lambda: _FakeLLM(GradeResult(sufficient=False, reason="no pricing")))
-    out = await grade_node({"messages": [], "retrieved": [{"text": "thông tin không liên quan"}]})
+    out = await grade_node({"messages": [],
+                            "retrieved_this_turn": [{"text": "thông tin không liên quan"}]})
     assert out["grade_sufficient"] is False
     assert route_after_grade(out) == "fallback"
 
@@ -36,5 +37,16 @@ async def test_insufficient_context_routes_fallback(monkeypatch):
 async def test_sufficient_context_routes_agent(monkeypatch):
     monkeypatch.setattr(grade_node_mod, "lite_llm",
                         lambda: _FakeLLM(GradeResult(sufficient=True, reason="ok")))
-    out = await grade_node({"messages": [], "retrieved": [{"text": "học phí 5tr"}]})
+    out = await grade_node({"messages": [], "retrieved_this_turn": [{"text": "học phí 5tr"}]})
     assert route_after_grade(out) == "agent"
+
+
+async def test_stale_chunks_cannot_vouch_for_this_turn(monkeypatch):
+    """H1: last turn's chunks sit in `retrieved` but must not be graded."""
+    monkeypatch.setattr(grade_node_mod, "lite_llm",
+                        lambda: _FakeLLM(GradeResult(sufficient=True, reason="stale hit")))
+    out = await grade_node({"messages": [],
+                            "retrieved": [{"text": "chunk lượt trước"}],
+                            "retrieved_this_turn": []})
+    assert out["grade_sufficient"] is False        # no LLM call, no false "sufficient"
+    assert route_after_grade(out) == "fallback"

@@ -24,8 +24,17 @@ def _last_human_text(state: dict) -> str:
 
 
 async def grade_node(state: dict) -> dict:
+    """Grade THIS turn's hits only.
+
+    Grading the accumulated `retrieved` lets a chunk fetched two turns ago vouch
+    for an unrelated new question — the bot then answers "sufficient" with nothing
+    relevant in hand instead of falling back (plan review H1).
+    """
+    chunks = [h.get("text", "") for h in state.get("retrieved_this_turn") or [] if h.get("text")]
+    if not chunks:
+        return {"grade_sufficient": False}         # retrieval ran and found nothing
+
     question = _last_human_text(state)
-    chunks = [h.get("text", "") for h in state.get("retrieved") or []]
     llm = lite_llm().with_structured_output(GradeResult)
     result = await with_retry(lambda: llm.ainvoke(build_grade_prompt(question, chunks)))
     return {"grade_sufficient": bool(result.sufficient)}
