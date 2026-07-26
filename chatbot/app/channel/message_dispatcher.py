@@ -13,6 +13,9 @@ without changing this file's control flow.
 from __future__ import annotations
 
 import logging
+import time
+
+from ..common.metrics_logger import emit
 
 logger = logging.getLogger(__name__)
 
@@ -72,19 +75,32 @@ class MessageDispatcher:
             await self.deliver_text(user_id, BUDGET_DEGRADE_LINE)
             return
 
+        started = time.monotonic()
         async with self._rate_limiter.sem:                   # global concurrency cap
-            reply = await self._invoke_graph(thread_id, user_id, text)
+            reply, self_escalated = await self._invoke_graph(thread_id, user_id, text)
         self._rate_limiter.add_spend(_EST_TOKENS_PER_TURN)
+        # `escalated`, the same key detect_objection uses — publishing the same
+        # fact under two names meant tool-path escalations never reached the
+        # go-live table at all.
+        emit(event="turn", latency_ms=int((time.monotonic() - started) * 1000),
+             escalated=self_escalated)
 
         if not reply:
             return
-        # TOCTOU close (Ph05): drop reply if handoff went active during the invoke.
-        if self._handoff_gate is not None and await self._handoff_gate.before_send(thread_id):
+        # TOCTOU close (Ph05): drop the reply if handoff went active during the
+        # invoke — UNLESS the graph itself flipped it. When the bot escalates
+        # (objection → human, handoff_to_human), it sets the handoff table inside
+        # the same invoke, and this check would then swallow the bot's own
+        # honest-fallback line: the customer gets silence while a human is paged.
+        # `state["handoff"]` is what distinguishes the two, and this is its reader.
+        if (not self_escalated and self._handoff_gate is not None
+                and await self._handoff_gate.before_send(thread_id)):
             logger.info("handoff flipped mid-invoke for %s → drop reply", thread_id)
             return
         await self.deliver_text(user_id, reply)
 
-    async def _invoke_graph(self, thread_id: str, user_id: str, text: str) -> str:
+    async def _invoke_graph(self, thread_id: str, user_id: str, text: str) -> tuple:
+        """Return `(reply, self_escalated)` — see the TOCTOU note in `_handle`."""
         from langchain_core.messages import HumanMessage
 
         from ..graph.graph_builder import get_graph
@@ -96,12 +112,14 @@ class MessageDispatcher:
                  "user_id": user_id, "channel": self._adapter.channel},
                 config={"configurable": {"thread_id": thread_id}},
             )
-            return _extract_reply(state)
+            # `escalated`, NOT `handoff`: only a real escalation writes the row
+            # during this invoke, and only that case may bypass the drop below.
+            return _extract_reply(state), bool(state.get("escalated"))
         except Exception as exc:                             # never lose the turn silently
             logger.exception("graph invoke failed for %s", thread_id)
             if self._error_notify is not None:
                 await self._error_notify(f"⚠️ Lỗi xử lý {thread_id}: {exc}")
-            return SOFT_FAIL_LINE
+            return SOFT_FAIL_LINE, False
 
     async def deliver_text(self, user_id: str, text: str) -> None:
         """Typing indicator + deliver (shadow-gate aware in Ph06)."""

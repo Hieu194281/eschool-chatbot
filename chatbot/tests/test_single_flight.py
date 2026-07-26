@@ -32,7 +32,7 @@ def _make_dispatcher(monkeypatch, tracker):
         tracker["max"] = max(tracker["max"], tracker["cur"])
         await asyncio.sleep(0.05)
         tracker["cur"] -= 1
-        return f"reply:{text}"
+        return f"reply:{text}", False        # (reply, bot escalated to a human?)
 
     monkeypatch.setattr(disp, "_invoke_graph", fake_invoke)
     return disp, delivered
