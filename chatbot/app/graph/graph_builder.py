@@ -1,17 +1,25 @@
 """Assemble + compile the StateGraph; hold the compiled singleton.
 
-Edges (see phase-03 diagram):
-    START → agent
+Edges:
+    START → detect_objection
+    detect     ─ none ───────────────────→ agent
+               ─ 4 nhóm ─────────────────→ handle_objection
+               ─ so_sanh / lặp lần 2 ────→ fallback   (handoff, no generated reply)
     agent      ─ tool_calls ─────────────→ tool_exec   (loop cap → fallback)
                ─ final text ─────────────→ reflect_lite
     tool_exec  ─ retrieved ───────────────→ grade_chunks
                ─ else ───────────────────→ agent
     grade      ─ sufficient ──────────────→ agent
                ─ insufficient ───────────→ fallback
+    handle_objection ────────────────────→ reflect_lite
     fallback   ──────────────────────────→ reflect_lite
     reflect    ─ ok / safest ─────────────→ pricing_guard
-               ─ one fix ────────────────→ agent
+               ─ fix (objection) ────────→ handle_objection   (once — C3)
+               ─ fix (thường) ───────────→ agent
     pricing_guard ───────────────────────→ END   (deterministic, last gate)
+
+EVERY branch converges on reflect_lite → pricing_guard. The objection branch in
+particular gets no shortcut: it is the one most likely to talk about money.
 
 Checkpointer lifecycle (red-team #3) is handled by the caller (main.py lifespan),
 which keeps the AsyncPostgresSaver context open for the whole app lifetime.
@@ -22,8 +30,10 @@ from __future__ import annotations
 import logging
 
 from .nodes.agent_node import agent_node, route_after_agent
+from .nodes.detect_objection import detect_objection_node, route_after_detect
 from .nodes.fallback_node import fallback_node
 from .nodes.grade_node import grade_node, route_after_grade
+from .nodes.handle_objection import handle_objection_node
 from .nodes.pricing_guard import pricing_guard_node
 from .nodes.reflect_node import reflect_node, route_after_reflect
 from .nodes.tool_exec_node import route_after_tools, tool_exec_node
@@ -39,6 +49,8 @@ def build_graph(checkpointer=None):
     from langgraph.graph import END, START, StateGraph
 
     builder = StateGraph(ConvState)
+    builder.add_node("detect_objection", detect_objection_node)
+    builder.add_node("handle_objection", handle_objection_node)
     builder.add_node("agent", agent_node)
     builder.add_node("tool_exec", tool_exec_node)
     builder.add_node("grade_chunks", grade_node)
@@ -46,7 +58,12 @@ def build_graph(checkpointer=None):
     builder.add_node("reflect_lite", reflect_node)
     builder.add_node("pricing_guard", pricing_guard_node)
 
-    builder.add_edge(START, "agent")
+    builder.add_edge(START, "detect_objection")
+    builder.add_conditional_edges(
+        "detect_objection", route_after_detect,
+        {"agent": "agent", "handle_objection": "handle_objection", "fallback": "fallback"},
+    )
+    builder.add_edge("handle_objection", "reflect_lite")
     builder.add_conditional_edges(
         "agent", route_after_agent,
         {"tool_exec": "tool_exec", "reflect_lite": "reflect_lite", "fallback": "fallback"},
@@ -62,7 +79,8 @@ def build_graph(checkpointer=None):
     builder.add_edge("fallback", "reflect_lite")
     builder.add_conditional_edges(
         "reflect_lite", route_after_reflect,
-        {"pricing_guard": "pricing_guard", "agent": "agent"},
+        {"pricing_guard": "pricing_guard", "agent": "agent",
+         "handle_objection": "handle_objection"},
     )
     builder.add_edge("pricing_guard", END)
 

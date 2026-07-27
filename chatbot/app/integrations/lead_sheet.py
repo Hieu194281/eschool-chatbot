@@ -15,12 +15,27 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+# v2 elicitation fields are APPENDED, never inserted: the live sheet already has
+# data under the original columns, and inserting would shift every existing value.
 COLUMNS = [
     "channel_user_id", "ten", "sdt", "khoa_quan_tam", "nhu_cau", "do_nong",
     "sales_stage", "chat_link", "consent", "consent_at", "updated_at",
+    "lop", "tinh_trang", "muc_tieu", "co_so", "lich_ranh", "khung_gio_tien",
 ]
 CHANNEL_USER_ID_COL = 1                 # column A
-_LAST_COL_LETTER = "K"                   # 11 columns → A..K
+
+
+def _col_letter(index: int) -> str:
+    """1-based column index → sheet letter. Computed, so adding a column can't
+    desync the write range from COLUMNS the way a hardcoded letter did."""
+    letters = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
+
+
+_LAST_COL_LETTER = _col_letter(len(COLUMNS))
 
 
 def _now_iso() -> str:
@@ -31,6 +46,7 @@ class LeadSheet:
     def __init__(self, worksheet) -> None:
         self._ws = worksheet
         self._locks: dict = {}
+        self._sheet_lock = asyncio.Lock()   # row-position-changing ops (see purge)
 
     def _lock(self, key: str):
         lock = self._locks.get(key)
@@ -55,8 +71,11 @@ class LeadSheet:
         return "created"
 
     async def upsert_lead(self, lead: dict, now: str | None = None) -> str:
+        # Lock order is ALWAYS per-user → sheet (purge takes only the sheet lock),
+        # so the two can never deadlock.
         async with self._lock(lead["channel_user_id"]):        # per-user (red-team #9)
-            return await asyncio.to_thread(self._upsert_sync, lead, now or _now_iso())
+            async with self._sheet_lock:
+                return await asyncio.to_thread(self._upsert_sync, lead, now or _now_iso())
 
     def _delete_sync(self, channel_user_id: str) -> bool:
         cell = self._ws.find(channel_user_id, in_column=CHANNEL_USER_ID_COL)
@@ -67,7 +86,8 @@ class LeadSheet:
 
     async def delete_lead(self, channel_user_id: str) -> bool:
         async with self._lock(channel_user_id):
-            return await asyncio.to_thread(self._delete_sync, channel_user_id)
+            async with self._sheet_lock:
+                return await asyncio.to_thread(self._delete_sync, channel_user_id)
 
     def _purge_sync(self, cutoff: datetime) -> int:
         records = self._ws.get_all_records()
@@ -81,7 +101,12 @@ class LeadSheet:
         return len(doomed)
 
     async def purge_older_than(self, cutoff: datetime) -> int:
-        return await asyncio.to_thread(self._purge_sync, cutoff)
+        # Deletes by ENUMERATE index, so an append/delete landing between the read
+        # and the deletes shifts physical rows and erases the WRONG lead's PII —
+        # exactly the failure the module docstring warns about for upsert. Purge
+        # runs on a scheduler, so excluding all writers for its duration is free.
+        async with self._sheet_lock:
+            return await asyncio.to_thread(self._purge_sync, cutoff)
 
 
 def _parse_iso(value: str):

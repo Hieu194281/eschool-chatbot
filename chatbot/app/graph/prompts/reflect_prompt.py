@@ -3,6 +3,11 @@
 Scope is DEMOTED to forbidden-promise / tone ONLY. Number checking lives in the
 deterministic pricing_guard. The regex blocklist is first-line (known phrases);
 Flash-Lite catches paraphrases the regex misses.
+
+Scarcity/urgency phrases and invented call-back deadlines live HERE rather than in
+the fail-closed guard on purpose: they are a TONE problem, and reflect_lite has a
+repair path (strip the phrase, keep the answer). Sending the honest-fallback
+instead would throw away a perfectly good reply over one pushy clause.
 """
 
 import re
@@ -16,6 +21,20 @@ _BLOCKLIST_PATTERNS = [
     r"(?:đảm\s*bảo|cam\s*kết|chắc\s*chắn)\s*100\s*%",
     r"miễn\s*phí\s*100\s*%",
     r"100\s*%\s*(?:đậu|đỗ|giỏi)",
+    # Scarcity — the centre has no "seats left" data and must never imply it.
+    r"(?:chỉ\s*)?còn\s*\d+\s*(?:chỗ|suất|slot)",
+    r"chỉ\s*còn\s*(?:vài|ít|mấy)\s*(?:chỗ|suất|slot)",
+    r"sắp\s*(?:hết|đầy)\s*(?:chỗ|suất|lớp)?",
+    r"nhanh\s*kẻo\s*(?:hết|muộn)",
+    # Urgency / pressure.
+    r"quyết\s*(?:định\s*)?sớm",
+    r"gấp\s*lên",
+    r"đăng\s*ký\s*ngay\s*(?:hôm\s*nay|bây\s*giờ)",
+    r"(?:trong|ngay)\s*hôm\s*nay\s*(?:thôi|nhé|kẻo)",
+    # Invented call-back deadlines — only Center["Cam kết gọi lại"] may state one.
+    r"gọi\s*(?:lại\s*)?(?:cho\s*(?:anh|chị)\s*)?trong\s*(?:vòng\s*)?\d+\s*(?:phút|giờ|tiếng)",
+    r"(?:em|tư\s*vấn\s*viên)\s*sẽ\s*gọi\s*(?:lại\s*)?(?:ngay\s*)?(?:trong\s*)?\d+\s*(?:phút|giờ|tiếng)",
+    r"chút\s*nữa\s*(?:em\s*)?(?:sẽ\s*)?gọi",
 ]
 _BLOCKLIST_RE = re.compile("|".join(_BLOCKLIST_PATTERNS), re.IGNORECASE)
 

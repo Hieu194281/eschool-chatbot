@@ -10,9 +10,15 @@ Impls are async so Ph05 can await network I/O without changing the tool_exec nod
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from langchain_core.tools import tool
+
+from ...common.metrics_logger import emit
+from ..sales_stage import SalesStage, derive_stage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -29,11 +35,35 @@ def capture_lead(
     khoa_quan_tam: str | None = None,
     nhu_cau: str | None = None,
     do_nong: str = "ấm",
+    lop: str | None = None,
+    tinh_trang: str | None = None,
+    muc_tieu: str | None = None,
+    co_so: str | None = None,
+    lich_ranh: str | None = None,
+    khung_gio_tien: str | None = None,
 ) -> str:
-    """Lưu thông tin lead vào hệ thống: tên, số điện thoại (sdt), khóa quan tâm,
-    nhu cầu, và độ nóng ("lạnh"/"ấm"/"nóng"). Gọi khi khách cung cấp SĐT hoặc thông
-    tin liên hệ."""
+    """Lưu thông tin lead vào hệ thống. Gọi NGAY khi khách tiết lộ bất kỳ thông tin
+    nào dưới đây — không cần đợi có đủ số điện thoại.
+
+    - ten, sdt: tên và số điện thoại
+    - khoa_quan_tam, nhu_cau: khóa đang quan tâm, nhu cầu chính
+    - do_nong: "lạnh" | "ấm" | "nóng"
+    - lop: bé đang học lớp mấy
+    - tinh_trang: lực học hiện tại của bé
+    - muc_tieu: mong muốn sau khóa học
+    - co_so: cơ sở khách tiện đi
+    - lich_ranh: buổi/ngày bé rảnh học
+    - khung_gio_tien: khung giờ khách tiện nghe tư vấn viên gọi"""
     return "Đã lưu thông tin khách."
+
+
+# Every LeadProfile field the LLM can write. Kept next to the @tool schema on
+# purpose: adding a field to one and not the other silently disables elicitation
+# (plan review H3).
+PROFILE_FIELDS = (
+    "ten", "sdt", "khoa_quan_tam", "nhu_cau", "do_nong",
+    "lop", "tinh_trang", "muc_tieu", "co_so", "lich_ranh", "khung_gio_tien",
+)
 
 
 @tool
@@ -61,25 +91,24 @@ async def run_capture_lead(args: dict, state: dict) -> ToolResult:
     from ...integrations.lead_sheet import get_lead_sheet
 
     profile = dict(state.get("lead_profile") or {})
-    for key in ("ten", "sdt", "khoa_quan_tam", "nhu_cau", "do_nong"):
+    for key in PROFILE_FIELDS:
         if args.get(key):
             profile[key] = args[key]
-    stage = "đã xin SĐT" if profile.get("sdt") else state.get("sales_stage", "đang tư vấn")
+    stage = derive_stage(profile, state.get("sales_stage"))
     channel_user_id = _thread_id(state)
 
     # PII/PDPD: consent recorded at capture (bot gives privacy notice before asking SĐT).
     lead = {
         "channel_user_id": channel_user_id,
-        "ten": profile.get("ten"),
-        "sdt": profile.get("sdt"),
-        "khoa_quan_tam": profile.get("khoa_quan_tam"),
-        "nhu_cau": profile.get("nhu_cau"),
+        **{key: profile.get(key) for key in PROFILE_FIELDS if key != "do_nong"},
         "do_nong": profile.get("do_nong", "ấm"),
         "sales_stage": stage,
         "chat_link": channel_user_id,
         "consent": "yes" if profile.get("sdt") else "",
         "consent_at": datetime.now(timezone.utc).isoformat() if profile.get("sdt") else "",
     }
+    # Presence only — the number itself never reaches the metrics log.
+    emit(event="lead", stage=stage, has_phone=bool(profile.get("sdt")))
     try:
         await get_lead_sheet().upsert_lead(lead)
         if profile.get("do_nong") == "nóng":
@@ -110,7 +139,7 @@ async def run_book_trial(args: dict, state: dict) -> ToolResult:
         pass  # non-fatal
     return ToolResult(
         "Dạ em đã ghi nhận lịch học thử, tư vấn viên sẽ xác nhận với mình sớm ạ.",
-        {"sales_stage": "đã chốt"},
+        {"sales_stage": SalesStage.DA_HEN_LICH},
     )
 
 
@@ -121,16 +150,37 @@ async def run_handoff_to_human(args: dict, state: dict) -> ToolResult:
     thread_id = _thread_id(state)
     reason = args.get("reason", "khách cần hỗ trợ trực tiếp")
     lead = dict(state.get("lead_profile") or {})
+    owned = False
     try:
         await get_handoff_manager().set_active(thread_id, reason)   # authoritative gate
+        owned = True
+    except Exception:
+        logger.exception("set_active failed for %s — thread NOT handed off", thread_id)
+    try:
         await telegram_notify.notify(
             telegram_notify.format_handoff(lead, reason, thread_id)
         )
     except Exception:
-        pass  # advisory handoff below still stops the bot for this turn
+        logger.warning("handoff Telegram notify failed for %s", thread_id)
+
+    if not owned:
+        # The row was never written, so no human owns this thread and nothing will
+        # silence the bot. Claiming otherwise is the worse failure: `sales_stage`
+        # HANDOFF is ABSORBING, so a transient DB blip would permanently park the
+        # conversation in "a human took over" while the bot keeps answering and no
+        # human is watching. Degrade to a normal turn instead — the next one retries.
+        return ToolResult(
+            "Dạ để em kết nối anh/chị với tư vấn viên hỗ trợ trực tiếp nhé ạ.",
+            {"handoff": True},
+        )
+    # `escalated` means exactly "THIS invoke wrote the handoff row". The dispatcher
+    # keys its TOCTOU exception on it — `handoff` alone would not do, because that
+    # flag is also set advisorily by fallback/guard/reflect and is not cleared,
+    # so after one routine honest-fallback every later turn would look escalated
+    # and a human taking over mid-invoke would be talked over.
     return ToolResult(
         "Dạ để em kết nối anh/chị với tư vấn viên hỗ trợ trực tiếp nhé ạ.",
-        {"handoff": True, "sales_stage": "cần người"},
+        {"handoff": True, "escalated": True, "sales_stage": SalesStage.HANDOFF},
     )
 
 
